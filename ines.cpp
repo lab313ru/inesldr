@@ -53,14 +53,81 @@ void load_bank(linput_t *li, int curea, int size, int sel)
 	file2base(li, qltell(li), curea, curea + size, FILEREG_PATCHABLE);
 }
 
+static unsigned char *_cdl = NULL;
+static FILE *cdl_file = NULL;
+
+//--------------------------------------------------------------------------
+bool cdl_load() {
+	char f_name[1024];
+	int f_name_size;
+	uint64 f_size;
+	get_input_file_path(f_name, sizeof(f_name));
+	f_name_size = strlen(f_name);
+	f_name[f_name_size - 1] = 'l';
+	f_name[f_name_size - 2] = 'd';
+	f_name[f_name_size - 3] = 'c';
+	if ((cdl_file = qfopen(f_name, "rb")) != NULL) {
+		add_pgm_cmt("CDL file    : present, processing");
+		f_size = qfsize(cdl_file);
+		_cdl = (unsigned char*)malloc(f_size);
+		qfread(cdl_file, _cdl, f_size);
+		qfclose(cdl_file);
+		return 1;
+	}
+	else
+		return 0;
+}
+
+int cdl_get_bank_org(int n_bank, int s_bank, int d_bank) {
+	int seg[5] = { 0, 0, 0, 0, 0 }, start = n_bank * s_bank, stop = start + s_bank, i, res_n = 0, res_i = 0;
+	if (_cdl != NULL) {
+		for (i = start; i < stop; i++)
+			if (_cdl[i] & 1) {
+				if (_cdl[i] & 0x80)
+					seg[0]++;
+				else
+					seg[((_cdl[i] >> 2) & 3) + 1]++;
+			}
+		if (seg[0] | seg[1] | seg[2] | seg[3] | seg[4]) {
+			res_n = seg[0];
+			res_i = 0;
+			if (res_n < seg[1]) {
+				res_n = seg[1];
+				res_i = 1;
+			}
+			if (res_n < seg[2]) {
+				res_n = seg[2];
+				res_i = 2;
+			}
+			if (res_n < seg[3]) {
+				res_n = seg[3];
+				res_i = 3;
+			}
+			if (res_n < seg[4]) {
+				res_n = seg[4];
+				res_i = 4;
+			}
+			return (0x6000 + (res_i << 13)) & ~(s_bank - 1);
+		}
+	}
+	return d_bank;
+}
+
+void cdl_free() {
+	if (_cdl != NULL) {
+		free(_cdl);
+		_cdl = NULL;
+	}
+}
+
 //--------------------------------------------------------------------------
 //
 //      load file into the database.
 //
 void idaapi load_file(linput_t *li, ushort /*neflag*/, const char * /*fileformatname*/)
 {
-	int curea, ofs, size;
-	unsigned char mapper, _prg;
+	unsigned int curea, ofs, size, i;
+	unsigned int mapper, _prg;
 	sel_t sel = 1;
 
 	if (ph.id != PLFM_6502)
@@ -73,104 +140,143 @@ void idaapi load_file(linput_t *li, ushort /*neflag*/, const char * /*fileformat
 
 	mapper = ((_hdr.map_byte0 & 0xF0) >> 4) | (_hdr.map_byte1 & 0xF0);
 	_prg = _hdr.prg_banks;
+	if (_prg == 0)
+		_prg = 256;
 
+	cdl_load();
 	create_filename_cmt();
 	add_pgm_cmt("Mapper      : %d", mapper);
 	add_pgm_cmt("16k Banks   : %d", _prg);
 
-	switch (mapper)
-	{
-	case 0:
-	case 3:
-	{
-		set_selector(sel, 0);
-		if (_prg == 1)
-		{
-			curea = 0xC000;
-			size = 0x4000;
-		}
-		else
-		{
-			curea = 0x8000;
-			size = 0x8000;
-		}
+	curea = 0;
+	if (_prg == 1) {
+		size = 0x4000;
+		set_selector(sel, curea >> 4);
+		curea = cdl_get_bank_org(0, size, 0xC000);
 		if (!add_segm(sel, curea, curea + size, "ROM", "CODE")) loader_failure();
 		file2base(li, qltell(li), curea, curea + size, FILEREG_PATCHABLE);
-		break;
 	}
-	case 1:
-	case 2:
-	{
-		int i;
-		curea = 0;
-		ofs = 0x8000;
-		size = 0x4000;
-		for (i = 0; i < _prg - 1; i++)
-		{
-			set_selector(sel, curea >> 4);
-			curea += ofs;
-			load_bank(li, curea, size, sel);
-			sel++;
-			curea += size;
-		}
-		ofs = 0xC000;
-		set_selector(sel, curea >> 4);
-		curea += ofs;
-		load_bank(li, curea, size, sel);
-		sel++;
-		curea += size;
-		break;
-	}
-	case 4:
-	case 121:
-	{
-		int i;
-		_prg <<= 1;
-		curea = 0;
-		ofs = 0x8000;
-		size = 0x2000;
-		for (i = 0; i < _prg - 2; i++)
-		{
-			set_selector(sel, curea >> 4);
-			curea += ofs;
-			load_bank(li, curea, size, sel);
-			sel++;
-			curea += size;
-			ofs ^= 0x2000;
-		}
-		ofs = 0xC000;
-		set_selector(sel, curea >> 4);
-		curea += ofs;
-		load_bank(li, curea, size, sel);
-		sel++;
-		curea += size;
-		ofs = 0xE000;
-		set_selector(sel, curea >> 4);
-		curea += ofs;
-		load_bank(li, curea, size, sel);
-		sel++;
-		curea += size;
-		break;
-	}
-	case 7:
-	case 11:
-	case 216:
-	default:
-	{
-		int i;
-		_prg >>= 1;
-		curea = 0;
-		ofs = 0x8000;
+	else if (_prg == 2) {
 		size = 0x8000;
-		for (i = 0; i < _prg; i++)
-		{
+		set_selector(sel, curea >> 4);
+		curea = 0x8000;
+		if (!add_segm(sel, curea, curea + size, "ROM", "CODE")) loader_failure();
+		file2base(li, qltell(li), curea, curea + size, FILEREG_PATCHABLE);
+	}
+	else {
+		switch (mapper) {
+		case 1:
+		case 2:
+		case 10:
+		case 16:
+		case 68:
+		case 71:
+		case 153:
+		case 156:
+		case 157:
+		case 159:
+		case 182: {
+			size = 0x4000;
+			for (i = 0; i < _prg - 1; i++)
+			{
+				set_selector(sel, curea >> 4);
+				curea += cdl_get_bank_org(i, size, 0x8000);
+				load_bank(li, curea, size, sel);
+				sel++;
+				curea += 0x10000;
+			}
 			set_selector(sel, curea >> 4);
-			curea += ofs;
+			curea += 0xC000;
+			load_bank(li, curea, size, sel);
+			break;
+		}
+		case 4:
+		case 5:
+		case 6:
+		case 9:
+		case 12:
+		case 14:
+		case 15:
+		case 23:
+		case 83:
+		case 121: {
+			_prg <<= 1;
+			ofs = 0x8000;
+			size = 0x2000;
+			for (i = 0; i < _prg - 2; i++)
+			{
+				set_selector(sel, curea >> 4);
+				curea += cdl_get_bank_org(i, size, ofs);
+				load_bank(li, curea, size, sel);
+				sel++;
+				curea += 0x10000;
+				ofs ^= 0x2000;
+			}
+			set_selector(sel, curea >> 4);
+			curea += cdl_get_bank_org(i, size, 0xC000);
 			load_bank(li, curea, size, sel);
 			sel++;
-			curea += size;
+			curea += 0x10000;
+			set_selector(sel, curea >> 4);
+			curea += 0xE000;
+			load_bank(li, curea, size, sel);
+			break;
 		}
-	}
+		case 42: {
+			_prg <<= 1;
+			size = 0x2000;
+			for (i = 0; i < _prg - 4; i++)
+			{
+				set_selector(sel, curea >> 4);
+				curea += 0x6000;
+				load_bank(li, curea, size, sel);
+				sel++;
+				curea += 0x10000;
+			}
+			size = 0x8000;
+			set_selector(sel, curea >> 4);
+			curea += 0x8000;
+			load_bank(li, curea, size, sel);
+			break;
+		}
+		case 17:
+		case 18:
+		case 19:
+		case 80:
+		case 82:
+		default: {
+			_prg <<= 1;
+			size = 0x2000;
+			for (i = 0; i < _prg - 1; i++)
+			{
+				set_selector(sel, curea >> 4);
+				curea += cdl_get_bank_org(i, size, 0x8000);
+				load_bank(li, curea, size, sel);
+				sel++;
+				curea += 0x10000;
+			}
+			set_selector(sel, curea >> 4);
+			curea += 0xE000;
+			load_bank(li, curea, size, sel);
+			break;
+		}
+		case 7:
+		case 11:
+		case 13:
+		case 216: {
+			_prg >>= 1;
+			ofs = 0x8000;
+			size = 0x8000;
+			for (i = 0; i < _prg; i++)
+			{
+				set_selector(sel, curea >> 4);
+				curea += ofs;
+				load_bank(li, curea, size, sel);
+				sel++;
+				curea += 0x10000;
+			}
+		}
+		}
 	}
 
 	qlseek(li, (_hdr.prg_banks << 14) + sizeof(_hdr) - sizeof(_vect), SEEK_SET);
@@ -196,9 +302,11 @@ void idaapi load_file(linput_t *li, ushort /*neflag*/, const char * /*fileformat
 
 	//  set_default_dataseg(0);
 
-	add_entry(1, to_ea(sel2para(sel - 1), _vect.nmi_vect), "NMI", true);
-	add_entry(2, to_ea(sel2para(sel - 1), _vect.res_vect), "RESET", true);
-	add_entry(3, to_ea(sel2para(sel - 1), _vect.irq_vect), "IRQ", true);
+	add_entry(1, to_ea(sel2para(sel), _vect.nmi_vect), "NMI", true);
+	add_entry(2, to_ea(sel2para(sel), _vect.res_vect), "RESET", true);
+	add_entry(3, to_ea(sel2para(sel), _vect.irq_vect), "IRQ", true);
+
+	cdl_free();
 }
 
 //----------------------------------------------------------------------
